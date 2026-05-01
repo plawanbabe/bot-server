@@ -2,6 +2,7 @@ fastapi
 uvicorn
 sqlalchemy
 pydantic
-python-dotenv
-pyjwt
+PyJWT
 psycopg2-binary
+customtkinter
+requests
