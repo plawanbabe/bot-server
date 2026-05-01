@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import jwt
 from fastapi import FastAPI, HTTPException, Header
@@ -8,19 +9,46 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# 🔐 SECRET / ADMIN (เปลี่ยนแล้ว)
+# =========================
+# ENV
+# =========================
 SECRET = os.getenv("LICENSE_SECRET", "RINBELL_SUPER_SECRET_2026")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "RINBELL_ADMIN_2026")
 
-# 💾 DB (Render-safe path)
-DB_URL = os.getenv("DB_URL", "sqlite:///./licenses.db")
+# บังคับให้มี DB_URL เพื่อไม่ให้ fallback ไป sqlite แบบเงียบ ๆ
+DB_URL = os.getenv("DB_URL")
+if not DB_URL:
+    raise RuntimeError("DB_URL not set")
 
+# Render Postgres มักต้องใช้ sslmode=require
+def ensure_sslmode_require(url: str) -> str:
+    if url.startswith(("postgresql://", "postgres://")):
+        parts = urlparse(url)
+        query = dict(parse_qsl(parts.query))
+        if "sslmode" not in query:
+            query["sslmode"] = "require"
+            parts = parts._replace(query=urlencode(query))
+            return urlunparse(parts)
+    return url
+
+DB_URL = ensure_sslmode_require(DB_URL)
+
+# =========================
+# APP / DB
+# =========================
 app = FastAPI(title="License Server")
 
-engine = create_engine(
-    DB_URL,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
-)
+if DB_URL.startswith("sqlite"):
+    engine = create_engine(
+        DB_URL,
+        connect_args={"check_same_thread": False},
+    )
+else:
+    engine = create_engine(
+        DB_URL,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -38,11 +66,17 @@ class License(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-Base.metadata.create_all(bind=engine)
+def db():
+    return SessionLocal()
+
+
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
 
 
 # =========================
-# 📦 REQUEST MODELS
+# MODELS
 # =========================
 class VerifyRequest(BaseModel):
     key: str
@@ -63,17 +97,13 @@ class BanRequest(BaseModel):
 
 
 # =========================
-# 🔧 UTILS
+# UTILS
 # =========================
-def db():
-    return SessionLocal()
-
-
 def create_token(key: str):
     payload = {
         "key": key,
         "iat": int(time.time()),
-        "exp": int(time.time()) + (15 * 24 * 60 * 60)  # 15 วัน
+        "exp": int(time.time()) + (15 * 24 * 60 * 60),  # 15 วัน
     }
     return jwt.encode(payload, SECRET, algorithm="HS256")
 
@@ -87,22 +117,37 @@ def require_admin(x_admin_key: str | None):
         raise HTTPException(status_code=403, detail="forbidden")
 
 
+def normalize_key(value: str) -> str:
+    return (value or "").strip()
+
+
 # =========================
-# 🌐 HEALTH CHECK (สำคัญสำหรับ Render)
+# HEALTH CHECK
 # =========================
 @app.get("/")
 def root():
     return {"status": "ok"}
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 # =========================
-# 🔐 VERIFY LOGIN
+# VERIFY LOGIN
 # =========================
 @app.post("/verify")
 def verify(data: VerifyRequest):
+    key = normalize_key(data.key)
+    hwid = normalize_key(data.hwid)
+
+    if not key or not hwid:
+        raise HTTPException(status_code=422, detail="missing_key_or_hwid")
+
     session = db()
     try:
-        lic = session.query(License).filter_by(license_key=data.key).first()
+        lic = session.query(License).filter_by(license_key=key).first()
 
         if not lic:
             raise HTTPException(status_code=403, detail="invalid_key")
@@ -112,23 +157,24 @@ def verify(data: VerifyRequest):
 
         # bind ครั้งแรก
         if not lic.hwid:
-            lic.hwid = data.hwid
+            lic.hwid = hwid
             session.commit()
 
-        if lic.hwid != data.hwid:
+        # เช็ค HWID
+        if lic.hwid != hwid:
             raise HTTPException(status_code=403, detail="hwid_mismatch")
 
         return {
             "status": "ok",
-            "token": create_token(data.key),
-            "hwid_bound": True
+            "token": create_token(key),
+            "hwid_bound": True,
         }
     finally:
         session.close()
 
 
 # =========================
-# ❤️ HEARTBEAT (เช็คทุก 10 นาที)
+# HEARTBEAT
 # =========================
 @app.get("/heartbeat")
 def heartbeat(authorization: str | None = Header(default=None)):
@@ -136,13 +182,15 @@ def heartbeat(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="no_token")
 
     token = authorization.replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="no_token")
 
     try:
         payload = decode_token(token)
     except Exception:
         raise HTTPException(status_code=401, detail="invalid_token")
 
-    key = payload.get("key")
+    key = normalize_key(payload.get("key", ""))
     if not key:
         raise HTTPException(status_code=401, detail="invalid_token")
 
@@ -158,23 +206,27 @@ def heartbeat(authorization: str | None = Header(default=None)):
 
 
 # =========================
-# 🛠 ADMIN
+# ADMIN
 # =========================
 @app.post("/admin/add")
 def admin_add(data: KeyRequest, x_admin_key: str | None = Header(default=None)):
     require_admin(x_admin_key)
 
+    key = normalize_key(data.key)
+    if not key:
+        raise HTTPException(status_code=422, detail="missing_key")
+
     session = db()
     try:
-        existing = session.query(License).filter_by(license_key=data.key).first()
+        existing = session.query(License).filter_by(license_key=key).first()
         if existing:
             raise HTTPException(status_code=409, detail="key_exists")
 
         lic = License(
-            license_key=data.key,
-            note=data.note or "",
+            license_key=key,
+            note=(data.note or "").strip(),
             active=True,
-            hwid=None
+            hwid=None,
         )
         session.add(lic)
         session.commit()
@@ -187,9 +239,13 @@ def admin_add(data: KeyRequest, x_admin_key: str | None = Header(default=None)):
 def admin_reset(data: ResetRequest, x_admin_key: str | None = Header(default=None)):
     require_admin(x_admin_key)
 
+    key = normalize_key(data.key)
+    if not key:
+        raise HTTPException(status_code=422, detail="missing_key")
+
     session = db()
     try:
-        lic = session.query(License).filter_by(license_key=data.key).first()
+        lic = session.query(License).filter_by(license_key=key).first()
         if not lic:
             raise HTTPException(status_code=404, detail="not_found")
 
@@ -204,9 +260,13 @@ def admin_reset(data: ResetRequest, x_admin_key: str | None = Header(default=Non
 def admin_ban(data: BanRequest, x_admin_key: str | None = Header(default=None)):
     require_admin(x_admin_key)
 
+    key = normalize_key(data.key)
+    if not key:
+        raise HTTPException(status_code=422, detail="missing_key")
+
     session = db()
     try:
-        lic = session.query(License).filter_by(license_key=data.key).first()
+        lic = session.query(License).filter_by(license_key=key).first()
         if not lic:
             raise HTTPException(status_code=404, detail="not_found")
 
@@ -221,9 +281,13 @@ def admin_ban(data: BanRequest, x_admin_key: str | None = Header(default=None)):
 def admin_unban(data: BanRequest, x_admin_key: str | None = Header(default=None)):
     require_admin(x_admin_key)
 
+    key = normalize_key(data.key)
+    if not key:
+        raise HTTPException(status_code=422, detail="missing_key")
+
     session = db()
     try:
-        lic = session.query(License).filter_by(license_key=data.key).first()
+        lic = session.query(License).filter_by(license_key=key).first()
         if not lic:
             raise HTTPException(status_code=404, detail="not_found")
 
